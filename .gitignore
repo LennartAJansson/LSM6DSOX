@@ -1,3 +1,5 @@
+.env
 .pio/
 .vscode/
 .vs/
+managed_components/

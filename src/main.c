@@ -23,9 +23,6 @@ static const char *TAG = "LSM6DSOX_APP";
 #define LSM6DSOX_CTRL2_G            0x11
 #define LSM6DSOX_OUTX_L_G           0x22
 
-#define WIFI_SSID                   "YOUR_SSID"
-#define WIFI_PASS                   "YOUR_PASSWORD"
-
 #define NATS_HOST                   "192.168.50.47"   // <-- din NATS-server
 #define NATS_PORT                   4222
 #define NATS_SUBJECT                "sensors.lsm6dsox.raw"
@@ -70,6 +67,10 @@ static void wifi_init_sta(void) {
             .password = WIFI_PASS,
         },
     };
+    // Kopiera in de dolda värdena säkert i minnet om det bråkar
+    // strcpy((char *)wifi_config.sta.ssid, WIFI_SSID);
+    // strcpy((char *)wifi_config.sta.password, WIFI_PASS);
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
