@@ -6,7 +6,7 @@ env = DefaultEnvironment()
 
 # Läs .env-filen om den finns
 if os.path.exists(".env"):
-    with open(".env") as f:
+    with open(".env", encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             # Hoppa över tomma rader och kommentarer
@@ -22,3 +22,5 @@ if os.path.exists(".env"):
             
             # Sätt variabeln i PlatformIOs interna byggmiljö (sysenv)
             env["ENV"][key] = value
+            if key in ("WIFI_SSID", "WIFI_PASS"):
+                env.Append(CPPDEFINES=[(key, '\\"' + value + '\\"')])

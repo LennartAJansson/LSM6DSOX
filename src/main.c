@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/i2c_master.h"
 #include "lwip/sockets.h"
@@ -13,6 +14,11 @@
 #include "cJSON.h"
 
 static const char *TAG = "LSM6DSOX_APP";
+
+// WiFi-uppgifter kommer från .env via read_env.py (se .env.example) – ligger inte i git
+#if !defined(WIFI_SSID) || !defined(WIFI_PASS)
+#error "WIFI_SSID/WIFI_PASS saknas. Skapa en .env i projektroten (se .env.example)."
+#endif
 
 #define I2C_MASTER_SDA_IO           11
 #define I2C_MASTER_SCL_IO           12
@@ -23,13 +29,15 @@ static const char *TAG = "LSM6DSOX_APP";
 #define LSM6DSOX_CTRL2_G            0x11
 #define LSM6DSOX_OUTX_L_G           0x22
 
-#define NATS_HOST                   "192.168.50.47"   // <-- din NATS-server
+#define NATS_HOST                   "192.168.1.254"   // <-- din NATS-server
 #define NATS_PORT                   4222
 #define NATS_SUBJECT                "sensors.lsm6dsox.raw"
+#define SENSOR_TYPE                 "lsm6dsox"
 
 i2c_master_dev_handle_t dev_handle;
 static EventGroupHandle_t wifi_event_group;
 static int nats_sock = -1;
+static esp_netif_t *sta_netif = NULL; // För att kunna läsa ut IP-adressen i kuvertet
 #define WIFI_CONNECTED_BIT BIT0
 
 // ---------------- WiFi ----------------
@@ -53,7 +61,7 @@ static void wifi_init_sta(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -61,6 +69,8 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
+    ESP_LOGI(TAG, "WiFi SSID: %s", WIFI_SSID);
+    
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
@@ -103,17 +113,39 @@ static esp_err_t nats_connect(void) {
         return ESP_FAIL;
     }
 
-    const char *connect_msg = "CONNECT {\"verbose\":false,\"pedantic\":false}\r\n";
-    send(nats_sock, connect_msg, strlen(connect_msg), 0);
+    // Läs bort serverns INFO-rad först, skicka sedan CONNECT (samma ordning som Barometer)
+    char buf[512];
+    recv(nats_sock, buf, sizeof(buf), 0);
 
-    char buf[256];
-    recv(nats_sock, buf, sizeof(buf), 0); // dumpar INFO-raden
+    const char *connect_msg = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"name\":\"esp32-s3-lsm6dsox\"}\r\n";
+    send(nats_sock, connect_msg, strlen(connect_msg), 0);
 
     ESP_LOGI(TAG, "Ansluten till NATS på %s:%d", NATS_HOST, NATS_PORT);
     return ESP_OK;
 }
 
+// Läser det servern skickat (utan att blockera) och svarar på PING med PONG,
+// annars kopplar servern ner oss som "stale connection" efter några minuter.
+static void nats_service_incoming(void) {
+    char buf[256];
+    int len = recv(nats_sock, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+    if (len > 0) {
+        buf[len] = 0;
+        if (strstr(buf, "PING") != NULL) {
+            send(nats_sock, "PONG\r\n", 6, 0);
+        }
+    } else if (len == 0) {
+        ESP_LOGW(TAG, "NATS-servern stängde anslutningen, kopplar om");
+        close(nats_sock);
+        nats_sock = -1;
+    }
+    // len < 0 med EAGAIN/EWOULDBLOCK = inget att läsa just nu
+}
+
 static esp_err_t nats_publish(const char *subject, const char *payload, size_t len) {
+    if (nats_sock >= 0) {
+        nats_service_incoming();
+    }
     if (nats_sock < 0) {
         if (nats_connect() != ESP_OK) return ESP_FAIL;
     }
@@ -129,6 +161,23 @@ static esp_err_t nats_publish(const char *subject, const char *payload, size_t l
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+// ---------------- Kuvert ----------------
+
+// Samma sändar-identitet som Barometer: "MAC=XX:XX:XX:XX:XX:XX,IP=YYY.YYY.YYY.YYY"
+static void get_sender_identity(char *id_buffer, size_t max_len) {
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+    esp_netif_ip_info_t ip_info;
+    char ip_str[16] = "0.0.0.0";
+    if (sta_netif && esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK) {
+        esp_ip4addr_ntoa(&ip_info.ip, ip_str, sizeof(ip_str));
+    }
+
+    snprintf(id_buffer, max_len, "MAC=%02X:%02X:%02X:%02X:%02X:%02X,IP=%s",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], ip_str);
 }
 
 // ---------------- LSM6DSOX ----------------
@@ -210,20 +259,36 @@ void app_main(void) {
         ESP_LOGI(TAG, "ACCEL [g] | X: %5.2f Y: %5.2f Z: %5.2f || GYRO [dps] | X: %5.1f Y: %5.1f Z: %5.1f", ax, ay, az, gx, gy, gz);
 
         // ---- Publicera till NATS ----
-        cJSON *doc = cJSON_CreateObject();
-        cJSON_AddNumberToObject(doc, "t", (double)esp_log_timestamp());
-        cJSON_AddNumberToObject(doc, "ax", ax);
-        cJSON_AddNumberToObject(doc, "ay", ay);
-        cJSON_AddNumberToObject(doc, "az", az);
-        cJSON_AddNumberToObject(doc, "gx", gx);
-        cJSON_AddNumberToObject(doc, "gy", gy);
-        cJSON_AddNumberToObject(doc, "gz", gz);
+        // 1. Mätvärdes-JSON (det inre värdet)
+        cJSON *value = cJSON_CreateObject();
+        cJSON_AddNumberToObject(value, "t", (double)esp_log_timestamp());
+        cJSON_AddNumberToObject(value, "ax", ax);
+        cJSON_AddNumberToObject(value, "ay", ay);
+        cJSON_AddNumberToObject(value, "az", az);
+        cJSON_AddNumberToObject(value, "gx", gx);
+        cJSON_AddNumberToObject(value, "gy", gy);
+        cJSON_AddNumberToObject(value, "gz", gz);
+        char *value_json = cJSON_PrintUnformatted(value);
 
-        char *json = cJSON_PrintUnformatted(doc);
-        nats_publish(NATS_SUBJECT, json, strlen(json));
+        // 2. Samma kuvert som Barometer: {"type":..,"sender":..,"value":"<mätvärdes-JSON som sträng>"}
+        //    cJSON eskapar citationstecknen i value åt oss.
+        char sender[64];
+        get_sender_identity(sender, sizeof(sender));
+
+        cJSON *envelope = cJSON_CreateObject();
+        cJSON_AddStringToObject(envelope, "type", SENSOR_TYPE);
+        cJSON_AddStringToObject(envelope, "sender", sender);
+        cJSON_AddStringToObject(envelope, "value", value_json);
+        char *json = cJSON_PrintUnformatted(envelope);
+
+        if (json) {
+            nats_publish(NATS_SUBJECT, json, strlen(json));
+        }
 
         free(json);
-        cJSON_Delete(doc);
+        free(value_json);
+        cJSON_Delete(envelope);
+        cJSON_Delete(value);
 
         vTaskDelay(pdMS_TO_TICKS(200));
     }
